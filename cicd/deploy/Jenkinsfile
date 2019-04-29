@@ -1,0 +1,629 @@
+#!groovy
+
+pipeline {
+
+    agent {
+        node {
+            label 'stacker'
+            customWorkspace "${env.HOME}/workspace/${env.JOB_NAME}/${env.BUILD_NUMBER}"
+        }
+    }
+
+    //pipeline options
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        disableConcurrentBuilds()
+        skipStagesAfterUnstable()
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    //parameters
+    parameters {
+        choice(name: 'ENVIRONMENT', description: 'Stacker ENV to use for running stacker commands', choices:['dev', 'staging', 'prod']) 
+        string(name: 'STACKER_BRANCH', description: 'git Stacker branch', defaultValue: 'master')
+        string(name: 'COMMIT_ID', description: 'Git tag or commit ID')
+        choice(name: 'CD_TYPE', description: 'Type of Deployment:\n full - deploy and release to live listener.\n deploy - deploy to test listener only.\n release - switch test and live listener', choices:['deploy', 'full', 'release']) 
+    }
+
+    stages {
+        stage('Initialize Environment') {
+            environment {
+                PROPS_FILE = 'jenkins.properties'
+            }
+            steps {
+                script {
+                    //loadProperties
+                    loadProperties()
+
+                    //Determine Region
+                    determineRegion()
+
+                    //determine DNS URL's
+                    if (ENVIRONMENT == 'dev') {
+                        shortEnv = 'd'
+                    } else if (ENVIRONMENT == 'staging') {
+                        shortEnv = 's'
+                    } else if (ENVIRONMENT == 'prod') {
+                        shortEnv = 'p'
+                    } else if (ENVIRONMENT == 'management') {
+                        shortEnv = 'm'
+                    } else {
+                        shortEnv = 'i'
+                    }
+
+                    if (APP_LOCATION == 'external') {
+                        APP_LOCATION = "ext.${shortEnv}"
+                    } else {
+                        APP_LOCATION = "int.${shortEnv}"
+                    }
+
+                    APP_URL = "https://${APP_URL}-${ENVIRONMENT}.${APP_LOCATION}.${REGION}.example.com"
+                    env.APP_URL = APP_URL
+                }
+                script {
+                    sh """
+                    {
+                        echo "-----------------------------------------------------------------------------------------"
+                        echo "INFO: Pipeline parameters"
+                        echo "ENVIRONMENT: $ENVIRONMENT"
+                        echo "REGION: $REGION"
+                        echo "STACKER_BRANCH: $STACKER_BRANCH"
+                        echo "COMMIT_ID: $COMMIT_ID"
+                        echo "CD_TYPE: $CD_TYPE"
+                        echo "SLACK_CHANNEL: $SLACK_CHANNEL"
+                        echo "-----------------------------------------------------------------------------------------"
+                    } 2> /dev/null
+                    """
+                }
+                script {
+                    //checkout scm
+
+                    //checkout stacker repo
+                    checkout([
+                        $class: 'GitSCM', 
+                             branches: [[name: STACKER_BRANCH]], 
+                             doGenerateSubmoduleConfigurations: false, 
+                             extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'Stacker']], 
+                             submoduleCfg: [], 
+                             userRemoteConfigs: [[credentialsId: 'deploy-aws-infrastructure', url: 'git@github.com:gary4est/stacker.git']]
+                    ])
+
+                }
+            }
+        }
+        stage('Deploy to Test Listener') {
+            //Only run a deploy when the CD_TYPE is equal to full or deploy
+            when {
+                expression { params.CD_TYPE == 'full' || params.CD_TYPE == 'deploy' }
+            }
+            environment {
+                SLACK_CHANNEL = "${SLACK_CHANNEL}"
+                GITHUB_URL = "${GITHUB_URL}"
+                APP_ECR = "${APP_ECR}"
+                STACKER_APP = "${STACKER_APP}"
+                STACKER_MODULE = "${STACKER_MODULE}"
+                ECR_MANAGER_URL = "${ECR_MANAGER_URL}"
+                ECR_MANAGER = "aws-ecr-manager-linux-amd64"
+            }
+            steps {
+                script {
+                    //notify deploy started
+                    event = "deploy"
+                    notifyJobStarted(event)
+
+                    //Validate the COMMIT_ID is available in AWS ECR Repo
+                    sh '''
+                    wget --quiet --output-document=${ECR_MANAGER} ${ECR_MANAGER_URL} 
+                    chmod +x ${ECR_MANAGER}
+                    '''
+
+                    def ecr_repo_status = sh(
+                        returnStdout: true, script: '''
+                            ./${ECR_MANAGER} check-image-exists --tag ${COMMIT_ID} --repository ${APP_ECR}  --region ${REGION}
+                          '''
+                    )
+
+                    //if (${COMMIT_ID} == ecr_repo_status) {
+                    if (COMMIT_ID == ecr_repo_status) {
+                        sh """
+                        {
+                            echo "-----------------------------------------------------------------------------------------"
+                            echo "INFO: ECR Image ${COMMIT_ID} found in ${REGION} ECR Repo ${APP_ECR}"
+                            echo "-----------------------------------------------------------------------------------------"
+                        } 2> /dev/null
+                        """
+                    } else {
+                        sh """
+                        {
+                            echo "-----------------------------------------------------------------------------------------"
+                            echo "ERROR: ECR Image ${COMMIT_ID} not found in ${REGION} ECR Repo ${APP_ECR}"
+                            echo "-----------------------------------------------------------------------------------------"
+                        } 2> /dev/null
+                        """
+                        currentBuild.result = 'FAILURE'
+                        return
+                    }
+
+                    //Run Deploy Script
+                    sh """
+                    {
+                        echo "-----------------------------------------------------------------------------------------"
+                        echo "INFO: Deploy ${COMMIT_ID} to ${REGION} ${ENVIRONMENT} environment"
+                        echo "-----------------------------------------------------------------------------------------"
+                    } 2> /dev/null
+                    """
+
+                    sh './cicd/scripts/deploy.sh'
+
+                }
+                script {
+                    //create Grafana annotations for deploy
+                    liveColorCommitId = readFile('deployLiveColorCommitId.txt').trim()
+                    env.liveColorCommitId = liveColorCommitId
+                    liveColor = readFile('deployLiveColor.txt').trim()
+                    env.liveColor = liveColor
+                    testColor = readFile('deploytestColor.txt').trim()
+                    env.testColor = testColor
+                
+                    //Notify Slack & Grafana
+                    event = "deploy"
+                    notifyJobFinished(event)
+                    //annotateEventToGrafana(event)
+                }
+            }
+        }
+        
+        stage('Validate Deploy to Test Listener') {
+            //Only run the test when the CD_TYPE is equal to full or deploy
+            when {
+                expression { params.CD_TYPE == 'full' || params.CD_TYPE == 'deploy' }
+            }
+            environment {
+                SLACK_CHANNEL = "${SLACK_CHANNEL}"
+                GITHUB_URL = "${GITHUB_URL}"
+                APP_ECR = "${APP_ECR}"
+                STACKER_APP = "${STACKER_APP}"
+                STACKER_MODULE = "${STACKER_MODULE}"
+                ECR_MANAGER_URL = "${ECR_MANAGER_URL}"
+                ECR_MANAGER = "aws-ecr-manager-linux-amd64"
+            }
+            steps {
+                script{
+                    sh """
+                    {
+                        echo "-----------------------------------------------------------------------------------------"
+                        echo "INFO: validate $ENVIRONMENT test listener deployment"
+                        echo "-----------------------------------------------------------------------------------------"
+                    } 2> /dev/null
+                    """
+
+                    //validate COMMIT_ID was deployed to test listener
+                    sh './cicd/scripts/verify_commit_id.sh -u ${APP_URL}:8443/public/health -c $COMMIT_ID'
+                    
+                    event = "deploy"
+                    notifyValidation(event)
+                }
+            }
+        }
+
+        stage('Test Deployment on Test Listener') {
+            //Only run the test when the CD_TYPE is equal to full or deploy
+            when {
+                expression { params.CD_TYPE == 'full' || params.CD_TYPE == 'deploy' }
+            }
+            environment {
+                SLACK_CHANNEL = "${SLACK_CHANNEL}"
+                GITHUB_URL = "${GITHUB_URL}"
+                APP_ECR = "${APP_ECR}"
+                STACKER_APP = "${STACKER_APP}"
+                STACKER_MODULE = "${STACKER_MODULE}"
+                ECR_MANAGER_URL = "${ECR_MANAGER_URL}"
+                ECR_MANAGER = "aws-ecr-manager-linux-amd64"
+            }
+            steps {
+                script{
+                    notifyTestStarted()
+
+                    sh """
+                    {
+                        echo "-----------------------------------------------------------------------------------------"
+                        echo "INFO: test $ENVIRONMENT test listener deployment"
+                        echo "-----------------------------------------------------------------------------------------"
+                    } 2> /dev/null
+                    """
+                    notifyTestFinished()
+                }
+            }
+        }
+
+        stage('Approve Release') {
+            //Only run a release when the CD_TYPE is equal to full or release
+            when {
+                expression { params.CD_TYPE == 'full' || params.CD_TYPE == 'release' }
+            }
+            environment {
+                SLACK_CHANNEL = "${SLACK_CHANNEL}"
+                GITHUB_URL = "${GITHUB_URL}"
+                APP_ECR = "${APP_ECR}"
+                STACKER_APP = "${STACKER_APP}"
+                STACKER_MODULE = "${STACKER_MODULE}"
+                ECR_MANAGER_URL = "${ECR_MANAGER_URL}"
+                ECR_MANAGER = "aws-ecr-manager-linux-amd64"
+            }
+            steps {
+                script {
+                    //Get approval to release to live listener
+                    approveRelease('gary@foo.example.com', 'gary')
+                    approveRelease('foo@bar.example.com', 'foo')
+
+                }
+            }
+        }
+
+        stage('Release to Live Listener') {
+            //Only run a release when the CD_TYPE is equal to full or release
+            when {
+                expression { params.CD_TYPE == 'full' || params.CD_TYPE == 'release' }
+            }
+            environment {
+                SLACK_CHANNEL = "${SLACK_CHANNEL}"
+                GITHUB_URL = "${GITHUB_URL}"
+                APP_ECR = "${APP_ECR}"
+                STACKER_APP = "${STACKER_APP}"
+                STACKER_MODULE = "${STACKER_MODULE}"
+                ECR_MANAGER_URL = "${ECR_MANAGER_URL}"
+                ECR_MANAGER = "aws-ecr-manager-linux-amd64"
+            }
+            steps {
+                script {
+                    event = "release"
+                    notifyJobStarted(event)
+
+                    //Call switch script
+                    sh """
+                    {
+                        echo "-----------------------------------------------------------------------------------------"
+                        echo "INFO: Release ${COMMIT_ID} to ${REGION} ${ENVIRONMENT} environment"
+                        echo "-----------------------------------------------------------------------------------------"
+                    } 2> /dev/null
+                    """
+                    sh './cicd/scripts/switch.sh'
+                }
+                script {
+                    //create Grafana annotations for release
+                    liveColorCommitId = readFile('releaseLiveColorCommitId.txt').trim()
+                    env.liveColorCommitId = liveColorCommitId
+                    liveColor = readFile('releaseLiveColor.txt').trim()
+                    env.liveColor = liveColor
+                    testColor = readFile('releasetestColor.txt').trim()
+                    env.testColor = testColor
+
+                    //Notify Slack
+                    notifyJobFinished(event)
+                }
+            }
+        }
+
+        stage('Validate Release to Live Listener') {
+            //Only run the test when the CD_TYPE is equal to full or deploy
+            when {
+                expression { params.CD_TYPE == 'full' || params.CD_TYPE == 'release' }
+            }
+            environment {
+                SLACK_CHANNEL = "${SLACK_CHANNEL}"
+                GITHUB_URL = "${GITHUB_URL}"
+                APP_ECR = "${APP_ECR}"
+                STACKER_APP = "${STACKER_APP}"
+                STACKER_MODULE = "${STACKER_MODULE}"
+                ECR_MANAGER_URL = "${ECR_MANAGER_URL}"
+                ECR_MANAGER = "aws-ecr-manager-linux-amd64"
+            }
+            steps {
+                script{
+                    sh """
+                    {
+                        echo "-----------------------------------------------------------------------------------------"
+                        echo "INFO: validate $ENVIRONMENT live listener release"
+                        echo "-----------------------------------------------------------------------------------------"
+                    } 2> /dev/null
+                    """
+
+                    //create Grafana annotations for release
+                    liveColorCommitId = readFile('releaseLiveColorCommitId.txt').trim()
+                    env.liveColorCommitId = liveColorCommitId
+                    liveColor = readFile('releaseLiveColor.txt').trim()
+                    env.liveColor = liveColor
+                    testColor = readFile('releasetestColor.txt').trim()
+                    env.testColor = testColor
+                    event = "release"
+
+                    //validate COMMIT_ID was released to Live listener
+                    sh './cicd/scripts/verify_commit_id.sh -u ${APP_URL}/public/health -c ${liveColorCommitId}'
+
+                    //Notify Slack & Grafana
+                    annotateEventToGrafana(event)
+                    notifyValidation(event)
+                }
+            }
+        }
+
+    }//stages
+
+    post {
+        success {
+            //change to pipeline status
+            slackSend channel: SLACK_CHANNEL,
+                        color: 'good',
+                        message: """
+                          |*Pipeline Succeeded*
+                          |Deployed: *${env.COMMIT_ID}*
+                          |Deploy time: ${currentBuild.durationString.replace(' and counting', '')}
+                          |Deployed App: *<${APP_URL}:8443/public/health|${STACKER_APP}>*
+                        """.stripMargin()
+        }
+        failure {
+            slackSend channel: SLACK_CHANNEL,
+                        color: 'danger',
+                        message: """
+                          |Deploy Failure: *<${env.JOB_URL}|${env.JOB_BASE_NAME.capitalize()}>*
+                          |Deploy failed to deploy ${env.COMMIT_ID} to ${env.REGION} ${ENVIRONMENT} environment
+                          |console output: <${env.BUILD_URL}console|console logs>
+                        """.stripMargin()
+        }
+        cleanup {
+            echo "Clean up Workspace"
+            deleteDir() /* clean up our workspace */
+        }
+    }//post
+
+}//pipeline
+
+//Functions
+//---------------------------------------------
+
+//determine Region
+def determineRegion() {
+    if (ENVIRONMENT == 'dev') {
+        REGION = "us-west-2"
+        env.REGION = REGION
+    } else {
+        REGION = "eu-west-3"
+        env.REGION = REGION 
+    }
+}
+
+//loadProperites from PROPS_FILE
+def loadProperties() {
+    def props = readProperties  file:"${PROPS_FILE}"
+    SLACK_CHANNEL = props['SLACK_CHANNEL']
+    GITHUB_URL = props['GITHUB_URL']
+    APP_ECR = props['APP_ECR']
+    APP_URL = props['APP_URL']
+    APP_LOCATION = props['APP_LOCATION']
+    env.APP_LOCATION = APP_LOCATION
+    STACKER_APP = props['STACKER_APP']
+    STACKER_MODULE = props['STACKER_MODULE']
+    ECR_MANAGER_URL = props['ECR_MANAGER_URL']
+}
+
+//Stacker Job Started
+def notifyJobStarted(event) {
+    if (event == 'release') {
+        app_url = APP_URL
+        listener_type = "Live"
+    } else {
+        app_url = "${APP_URL}:8443"
+        listener_type = "Test"
+    }
+
+    slackSend channel: SLACK_CHANNEL,
+               color: "#439FE0",
+               message: """
+                 |*${event.capitalize()} Started*
+                 |${event.capitalize()} *<${GITHUB_URL}/commit/${env.COMMIT_ID}|${env.COMMIT_ID}>* to ${env.REGION} ${env.ENVIRONMENT} environment ${listener_type} Listener
+                 |${event.capitalize()} Job: <${env.BUILD_URL}|${env.BUILD_NUMBER}>  
+                 |${event.capitalize()} App Endpoint: <${app_url}/public/health|${STACKER_APP}> 
+                 |console output: <${env.BUILD_URL}console|console logs>
+               """.stripMargin()
+}
+
+//Notify Stacker Job Finished
+def notifyJobFinished(event) {
+    if (event == 'release') {
+        app_url = "${APP_URL}"
+        listener_type = "Live"
+    } else {
+        app_url = "${APP_URL}:8443"
+        listener_type = "Test"
+    }
+
+    //slack
+    slackSend channel: SLACK_CHANNEL,
+                color: 'good',
+                message: """
+                  |*${event.capitalize()} Succeeded*
+                  |${event.capitalize()}ed: *${env.COMMIT_ID}* to ${env.REGION} ${env.ENVIRONMENT} environment ${listener_type} Listener 
+                  |${event.capitalize()} time: ${currentBuild.durationString.replace(' and counting', '')}
+                  |${event.capitalize()} App: *<${app_url}/public/health|${STACKER_APP}>*
+                """.stripMargin()
+}
+
+//Test Started
+def notifyTestStarted() {
+    slackSend channel: SLACK_CHANNEL,
+               color: "#439FE0",
+               message: """
+                 |*Testing Started*
+                 |Testing *<${GITHUB_URL}/commit/${env.COMMIT_ID}|${env.COMMIT_ID}>* on ${env.REGION} ${env.ENVIRONMENT} environment Test Listener
+                 |Testing Endpoint: <${APP_URL}:8443/public/health|${STACKER_APP}> 
+                 |console output: <${env.BUILD_URL}console|console logs>
+               """.stripMargin()
+}
+
+//Notify Test Finished
+def notifyTestFinished() {
+    slackSend channel: SLACK_CHANNEL,
+                color: 'good',
+                message: """
+                  |*Testing Finished*
+                  |Tested: *${env.COMMIT_ID}* on ${env.REGION} ${env.ENVIRONMENT} environment Test Listener 
+                  |Test time: ${currentBuild.durationString.replace(' and counting', '')}
+                  |Tested App: *<${APP_URL}:8443/public/health|${STACKER_APP}>*
+                """.stripMargin()
+}
+
+//Notify Validation
+def notifyValidation(event) {
+
+    if (event == 'deploy') {
+        app_url = "${APP_URL}:8443"
+    } else {
+        app_url = "${APP_URL}"
+    }
+    
+    slackSend channel: SLACK_CHANNEL,
+                color: 'good',
+                message: """
+                  |*Validated $event*
+                  |Validated App: *<${app_url}/public/health|${STACKER_APP}>*
+                  |Validation: *Okay*
+                """.stripMargin()
+}
+
+//Annotate Event to Grafana
+def annotateEventToGrafana(event) {
+    //withCredentials([string(credentialsId: 'grafana_token', variable: 'grafanaToken')]) {
+    withCredentials([[$class: 'StringBinding', credentialsId: 'grafana_token', variable: 'grafanaToken']]) {
+        grafanaToken = "${grafanaToken}"
+
+        if (event == 'deploy') {
+            listener_type = "Test"
+        } else {
+            listener_type = "Live"
+        }
+        //Annotate Deploy to Grafana
+        sh """#!/bin/bash
+        set -x
+        {
+            echo
+            echo "----------------------------------------------------------------"
+            echo "INFO: add Event ${event} to Grafana"
+            echo "----------------------------------------------------------------"
+            echo
+        } 2> /dev/null
+
+        cat << EOF > EventAnnotation.txt
+{
+  "text": "${event.capitalize()} commit ${COMMIT_ID} to '${STACKER_APP}' ${REGION} ${ENVIRONMENT} ${listener_type} Listener\\n\\n
+    <a href=\\"${GITHUB_URL}/commit/${LiveColorCommitId}\\">LiveListener: (${LiveColor}) (${LiveColorCommitId})</a>\\n
+    <a href=\\"${GITHUB_URL}/commit/${COMMIT_ID}\\">TestListener: (${testColor}) (${COMMIT_ID})</a>\\n
+    <a href=\\"${BUILD_URL}/console\\">Jenkins #${BUILD_NUMBER} (DEPLOY Logs)</a>",
+  "tags": [ "${event}", "env:${ENVIRONMENT}", "application:${STACKER_APP}", "commit:${COMMIT_ID}" ]
+}
+EOF
+
+        curl -s -X POST https://grafana.foo.example.com/api/annotations \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${grafanaToken}" \
+            --data @EventAnnotation.txt
+        """
+    }
+}
+
+//notify Result
+def notifyResult() {
+  script {
+    if (currentBuild.currentResult == 'ABORTED') {
+      color = '#808080'
+    }
+    if (currentBuild.currentResult == 'FAILURE') {
+      color = 'danger'
+    }
+    if (currentBuild.currentResult == 'SUCCESS') {
+      color = 'good'
+    }
+    if (currentBuild.currentResult == 'UNSTABLE') {
+      color = 'warning'
+    }
+    slackSend(
+      channel: "${SLACK_CHANNEL}",
+      color: "${color}",
+      message:
+        "Build *${currentBuild.currentResult}* - ${JOB_NAME}:${STACKER_BRANCH} - #${BUILD_NUMBER}\n" +
+        "Build Result: ${BUILD_URL}"
+    )
+  }
+}
+
+//Approve release to environment
+def approveRelease(authorizer, slack_name) {
+    //Send link to approval input
+    slackSend channel: SLACK_CHANNEL,
+    color: "#439FE0",
+    message: """
+        |*----------- Approval Requested ------------*
+        |*Approve Release:* <${GITHUB_URL}/commit/${env.COMMIT_ID}|${env.COMMIT_ID}> to ${ENVIRONMENT}
+        |*Approve Release:* @${slack_name} please approve <${BUILD_URL}input/|Approval Request> 
+    """.stripMargin()
+
+    sh """
+    {
+        echo "################################### APPROVAL ############################################"
+    } 2> /dev/null
+    """
+
+
+    //get approval
+    timeout(time: 10, unit: "MINUTES") {
+        def inputResponse = input(message: "Do you want to approve the release of ${COMMIT_ID} for ${STACKER_APP} to ${ENVIRONMENT}?",
+            submitter: "${authorizer}", submitterParameter: 'approver', id: 'rApproval', ok: "Approve ${ENVIRONMENT} release",
+            parameters:[booleanParam(defaultValue: true, description: '', name: 'promote')] )
+
+        approver = inputResponse['approver']
+        //env.APPROVER = APPROVER
+    }
+
+    sh """
+    {
+        echo "#########################################################################################"
+    } 2> /dev/null
+    """
+    
+    if (approver == authorizer) {
+        sh """
+        {
+            echo "-----------------------------------------------------------------------------------------"
+            echo "INFO: Release approved by ${approver}"
+            echo "-----------------------------------------------------------------------------------------"
+        } 2> /dev/null
+        """
+        slackSend channel: SLACK_CHANNEL,
+            color: "good",
+            message: """
+                |*Approved:* Release approved by ${approver}
+                |*------------ Request Approved -------------*
+            """.stripMargin() 
+
+    } else {
+        //send errors notifications and end build job
+        slackSend channel: SLACK_CHANNEL,
+            color: "danger",
+            message: """
+                |*Approval Error:* Approved by ${approver}
+                |*Approval Error:* Needs to be approved by ${authorizer}
+                |*------------ Approval Error --------------*
+            """.stripMargin()
+
+        sh """
+        {
+            echo "-----------------------------------------------------------------------------------------"
+            echo "ERROR: Release ${COMMIT_ID} not approved by ${authorizer}"
+            echo "-----------------------------------------------------------------------------------------"
+        } 2> /dev/null
+        """
+
+        currentBuild.result = 'FAILURE'
+        throw new Exception("Approval validation failed")
+    }
+}
